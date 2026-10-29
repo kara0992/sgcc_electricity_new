@@ -32,6 +32,7 @@ options:
   LLM_API_KEY: ""
   LLM_BASE_URL: ""
   LLM_MODEL: ""
+  CACHE_REPUBLISH_INTERVAL: 60
 schema:
   PHONE_NUMBER: str
   PASSWORD: password
@@ -49,3 +50,4 @@ schema:
   LLM_API_KEY: password
   LLM_BASE_URL: str?
   LLM_MODEL: str?
+  CACHE_REPUBLISH_INTERVAL: int?
