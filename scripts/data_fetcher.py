@@ -930,7 +930,7 @@ class DataFetcher:
             self._browser, self._context, self._page = self._setup_browser()
         except Exception as e:
             logging.error(f"浏览器启动/连接失败: {e}")
-            raise
+            return
         ErrorWatcher.instance().set_page(self._page)
         self._random_delay(1, 3)
         updator = SensorUpdator()
@@ -956,7 +956,7 @@ class DataFetcher:
                 self._browser.close()
                 if getattr(self, '_pw', None):
                     self._pw.stop()
-                raise
+                return
             logging.info("Logged in")
             # 登录成功后保存 Cookie
             # self._save_cookies(self._page)
@@ -966,6 +966,8 @@ class DataFetcher:
         except Exception:
             pass
         time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
+        # 登录后关闭可能弹出的配置/引导弹窗，避免遮挡后续操作
+        self._dismiss_popups()
         user_id_list = self._get_user_ids()
         for userid_index, user_id in enumerate(user_id_list):
             try:
@@ -1213,10 +1215,49 @@ class DataFetcher:
 
         return balance, last_daily_date, last_daily_usage, yearly_charge, yearly_usage, month_charge, month_usage, tou_data, enhanced_balance, bill_tou_data
 
+    def _dismiss_popups(self, page=None):
+        """关闭登录后网站可能弹出的配置/引导类弹窗(如 configurationPopup_dialog)，
+        否则其遮罩会拦截后续点击操作导致 Timeout 失败。"""
+        page = page or self._page
+        try:
+            page.wait_for_selector(
+                ".el-dialog__wrapper.configurationPopup_dialog", timeout=8000)
+        except Exception:
+            return  # 弹窗未出现，直接返回
+        try:
+            closed = False
+            close_btn = page.query_selector(
+                ".configurationPopup_dialog .el-dialog__headerbtn")
+            if close_btn and close_btn.is_visible():
+                close_btn.click()
+                closed = True
+            if not closed:
+                for b in page.query_selector_all(
+                        ".configurationPopup_dialog .el-dialog__footer button"):
+                    txt = (b.inner_text() or "").strip()
+                    if txt in ("确定", "知道了", "关闭", "暂不", "取消", "OK", "确认"):
+                        b.click()
+                        closed = True
+                        break
+            if not closed:
+                page.keyboard.press("Escape")
+            try:
+                page.wait_for_selector(
+                    ".el-dialog__wrapper.configurationPopup_dialog",
+                    state="hidden", timeout=5000)
+            except Exception:
+                pass
+            time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
+            logging.info("已关闭登录后的网站弹窗(configurationPopup_dialog)")
+        except Exception as e:
+            logging.warning(f"关闭网站弹窗失败(非致命): {e}")
+
     def _get_user_ids(self):
         """获取用户 ID 列表。优先从 el-dropdown 获取（余额页面），
         失败则从 el-select 获取（用电量页面），最后从页面源码正则匹配。"""
         try:
+            # 先关闭可能遮挡操作的弹窗
+            self._dismiss_popups()
             # 方式一：经典方式 - 从 el-dropdown 下拉框获取
             time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
             dropdowns = self._page.query_selector_all(".el-dropdown")
