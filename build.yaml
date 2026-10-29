@@ -1,0 +1,2 @@
+build_from:
+  amd64: registry.cn-hangzhou.aliyuncs.com/arcw/sgcc_electricity-amd64:latest
