@@ -39,6 +39,14 @@ def _get_cloak_launch():
             _HAS_CLOAKBROWSER = False
     return _cloak_launch if _HAS_CLOAKBROWSER else None
 
+class RiskControlError(Exception):
+    """国网风控（RK001）异常。
+
+    出现该错误说明账号/IP 已被 95598 的风控拦截，短时间内反复登录只会
+    加重风控（可能升级为封号），因此必须长时间退避后再试，不能立即重试。
+    """
+
+
 class DataFetcher:
 
     def __init__(self, username: str, password: str):
@@ -899,6 +907,7 @@ class DataFetcher:
             }""")
             if result:
                 logging.error(f"[RK001] 页面可见文本中检测到风控码: {result[:80]}")
+                self._rk001_detected = True
                 return True
         except Exception as e:
             logging.debug(f"RK001 JS检测异常: {e}")
@@ -907,6 +916,7 @@ class DataFetcher:
                 body_text = page.text_content("body") or ""
                 if "RK001" in body_text:
                     logging.error("[RK001] 页面 body 文本中包含风控码")
+                    self._rk001_detected = True
                     return True
             except Exception:
                 pass
@@ -953,9 +963,13 @@ class DataFetcher:
                         raise Exception("login failed")
             except Exception as e:
                 logging.error(f"Login error: {e}")
+                rk001_hit = bool(getattr(self, "_rk001_detected", False))
                 self._browser.close()
                 if getattr(self, '_pw', None):
                     self._pw.stop()
+                if rk001_hit:
+                    raise RiskControlError(
+                        "国网风控 RK001：本轮登录被拦截，需要长时间退避后再试")
                 raise
             logging.info("Logged in")
             # 登录成功后保存 Cookie
