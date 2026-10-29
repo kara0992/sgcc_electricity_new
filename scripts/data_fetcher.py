@@ -49,12 +49,40 @@ class RiskControlError(Exception):
 
 class DataFetcher:
 
-    def __init__(self, username: str, password: str):
+    def __init__(self, username: str, password: str,
+                 backup_username: Optional[str] = None,
+                 backup_password: Optional[str] = None):
         if 'PYTHON_IN_DOCKER' not in os.environ:
             import dotenv
             dotenv.load_dotenv(verbose=True)
-        self._username = username
-        self._password = password
+        self._username = (username or "").strip()
+        self._password = password or ""
+
+        # ── 多账号支持（主账号 + 备用账号；账号可以是手机号/用户名/邮箱）──
+        # 国网 95598 密码登录框支持「用户名/手机号/邮箱」，因此可用邮箱作为第二账号，
+        # 当主账号被 RK001 风控时自动切换，避免在同一账号上反复撞风控。
+        self._accounts = []
+        if self._username:
+            self._accounts.append({"label": self._mask_account(self._username),
+                                   "username": self._username,
+                                   "password": self._password})
+        _bk = (backup_username or "").strip()
+        if _bk and _bk != self._username:
+            self._accounts.append({"label": self._mask_account(_bk),
+                                   "username": _bk,
+                                   "password": backup_password or ""})
+        self._account_index = 0
+        self._rk_state = {}
+        self._load_account_state()
+        if len(self._accounts) > 1:
+            _cur = self.current_account()
+            self._username = _cur["username"]
+            self._password = _cur["password"]
+            logging.info(
+                f"已启用多账号：共 {len(self._accounts)} 个账号"
+                f"（{', '.join(a['label'] for a in self._accounts)}），"
+                f"当前使用 {_cur['label']}，该账号历史风控次数 "
+                f"{self._rk_state.get(_cur['label'], 0)}。")
 
         self.DRIVER_IMPLICITY_WAIT_TIME = int(os.getenv("DRIVER_IMPLICITY_WAIT_TIME", 60))
         self.RETRY_TIMES_LIMIT = int(os.getenv("RETRY_TIMES_LIMIT", 5))
@@ -69,6 +97,102 @@ class DataFetcher:
                     uid, name = pair.split(":", 1)
                     self._user_name_map[uid.strip()] = name.strip()
         self._init_db()
+
+    # ── 多账号 / 风控计数 相关工具方法 ──────────────────────────
+
+    @staticmethod
+    def _mask_account(name: str) -> str:
+        """账号打码，避免日志/状态文件里出现完整手机号或邮箱。"""
+        name = (name or "").strip()
+        if not name:
+            return "(空)"
+        if "@" in name:
+            local, _, domain = name.partition("@")
+            keep = local[:2] if len(local) > 2 else local[:1]
+            return "%s***@%s" % (keep, domain)
+        if len(name) >= 7:
+            return "%s****%s" % (name[:3], name[-4:])
+        return name[:1] + "***"
+
+    def _account_state_path(self) -> str:
+        return os.path.join(get_data_dir(), "account_state.json")
+
+    def _load_account_state(self):
+        """读取上次使用的账号下标与各账号累计被 RK001 的次数（跨重启保持）。"""
+        path = self._account_state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rk = data.get("rk") or {}
+            if isinstance(rk, dict):
+                self._rk_state = {str(k): int(v) for k, v in rk.items()}
+            idx = int(data.get("index", 0))
+            if 0 <= idx < len(self._accounts):
+                self._account_index = idx
+        except Exception as e:
+            logging.warning(f"读取账号状态文件失败(非致命，将使用主账号): {e}")
+
+    def _save_account_state(self):
+        path = self._account_state_path()
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"index": self._account_index,
+                           "rk": self._rk_state,
+                           "username": self._username}, f, ensure_ascii=False)
+        except Exception as e:
+            logging.warning(f"保存账号状态文件失败(非致命): {e}")
+
+    def current_account(self) -> dict:
+        if not self._accounts:
+            return {"label": self._mask_account(self._username),
+                    "username": self._username,
+                    "password": self._password}
+        return self._accounts[self._account_index]
+
+    def current_account_label(self) -> str:
+        return self.current_account()["label"]
+
+    def has_backup_account(self) -> bool:
+        return len(self._accounts) > 1
+
+    def note_rk001(self):
+        """记录当前账号被 RK001 拦截一次，用于判断是否该换账号。"""
+        label = self.current_account_label()
+        self._rk_state[label] = self._rk_state.get(label, 0) + 1
+        self._save_account_state()
+
+    def reset_rk001(self):
+        """登录成功，清零该账号的风控累计次数。"""
+        label = self.current_account_label()
+        if self._rk_state.get(label):
+            self._rk_state[label] = 0
+            self._save_account_state()
+
+    def switch_account(self, reason: str = "") -> bool:
+        """切换到历史被风控次数最少的另一个账号；无备用账号时返回 False。"""
+        if not self.has_backup_account():
+            return False
+        others = [i for i in range(len(self._accounts)) if i != self._account_index]
+        nxt = min(others, key=lambda i: (
+            self._rk_state.get(self._accounts[i]["label"], 0), i))
+        old_label = self.current_account_label()
+        self._account_index = nxt
+        cur = self._accounts[nxt]
+        self._username = cur["username"]
+        self._password = cur["password"]
+        self._rk001_detected = False
+        self._save_account_state()
+        logging.warning(
+            f"已切换登录账号：{old_label} → {cur['label']}"
+            f"（原因：{reason or '当前账号被 RK001 风控'}）；"
+            f"该账号历史风控次数 {self._rk_state.get(cur['label'], 0)}，"
+            f"切换结果已持久化，重启后仍使用该账号。")
+        return True
 
     def _init_db(self):
         self.db_type = os.getenv("DB_TYPE", "None").lower()
@@ -944,6 +1068,7 @@ class DataFetcher:
         ErrorWatcher.instance().set_page(self._page)
         self._random_delay(1, 3)
         updator = SensorUpdator()
+        logging.info(f"本次登录账号：{self.current_account_label()}")
 
         # Cookie 验证已禁用，每次均走完整登录流程
         cookie_valid = False
@@ -968,10 +1093,13 @@ class DataFetcher:
                 if getattr(self, '_pw', None):
                     self._pw.stop()
                 if rk001_hit:
+                    self.note_rk001()
                     raise RiskControlError(
-                        "国网风控 RK001：本轮登录被拦截，需要长时间退避后再试")
+                        f"国网风控 RK001：账号 {self.current_account_label()} "
+                        f"本轮登录被拦截，需要长时间退避后再试")
                 raise
             logging.info("Logged in")
+            self.reset_rk001()
             # 登录成功后保存 Cookie
             # self._save_cookies(self._page)
         # 登录后等待页面完全加载（防止导航未完成就查询 DOM）
