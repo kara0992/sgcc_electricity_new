@@ -103,6 +103,10 @@ def main():
     CACHE_REPUBLISH_INTERVAL = int(os.getenv("CACHE_REPUBLISH_INTERVAL", "60"))
     schedule.every(CACHE_REPUBLISH_INTERVAL).minutes.do(republish_or_fetch, updator, fetcher)
 
+    # 启动先把缓存里的“最近几天”日用电序列补发一次：
+    # 不发新登录，也能让集成把之前漏掉的日期补齐（如 10-24/10-25）
+    publish_cached_daily_series(fetcher)
+
     # 启动时先尝试从缓存恢复
     # 如果缓存恢复成功，则跳过本次启动时的实时抓取，避免频繁重启导致账号被封
     if not updator.republish():
@@ -116,10 +120,34 @@ def main():
         time.sleep(1)
 
 
+def publish_cached_daily_series(fetcher: DataFetcher):
+    """用本地缓存把“最近几天”的日用电序列补发一次（不触发新登录）。
+
+    本地缓存 sgcc_cache.json 里保存着上次成功抓取的 tou_data（逐日总量与
+    谷/平/峰/尖）。启动或每轮重发缓存时顺带推一条序列传感器，这样即使本次
+    不发登录，集成也能把之前漏掉的日期补齐。
+    """
+    try:
+        cache_file = os.path.join(get_data_dir(), "sgcc_cache.json")
+        if not os.path.exists(cache_file):
+            return
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for user_id, entry in (data or {}).items():
+            tou = (entry or {}).get("tou_data") or {}
+            if tou.get("daily"):
+                fetcher._publish_daily_series(user_id, tou)
+    except Exception as e:
+        logging.warning(f"补发日用电序列失败(不影响主流程): {e}")
+
+
 def republish_or_fetch(updator: SensorUpdator, fetcher: DataFetcher):
     if not updator.republish():
         logging.info("缓存数据已过期或不存在，正在从国家电网获取数据...")
         run_task(fetcher)
+    else:
+        # 缓存重发成功，顺带补发一次日用电序列（用于补齐历史空缺日期）
+        publish_cached_daily_series(fetcher)
 
 
 def run_task(data_fetcher: DataFetcher):
