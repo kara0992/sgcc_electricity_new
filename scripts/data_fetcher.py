@@ -930,7 +930,7 @@ class DataFetcher:
             self._browser, self._context, self._page = self._setup_browser()
         except Exception as e:
             logging.error(f"浏览器启动/连接失败: {e}")
-            return
+            raise
         ErrorWatcher.instance().set_page(self._page)
         self._random_delay(1, 3)
         updator = SensorUpdator()
@@ -956,7 +956,7 @@ class DataFetcher:
                 self._browser.close()
                 if getattr(self, '_pw', None):
                     self._pw.stop()
-                return
+                raise
             logging.info("Logged in")
             # 登录成功后保存 Cookie
             # self._save_cookies(self._page)
