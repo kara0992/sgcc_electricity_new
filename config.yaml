@@ -1,5 +1,5 @@
 name: "SGCC Electricity (patched)"
-version: "v1.8.3"
+version: "v1.8.4"
 slug: "sgcc_electricity_patched"
 description: "获取国网电费数据的插件"
 url: "https://github.com/ARC-MX/sgcc_electricity_new"
@@ -33,6 +33,12 @@ options:
   LLM_BASE_URL: ""
   LLM_MODEL: ""
   CACHE_REPUBLISH_INTERVAL: 60
+  BACKUP_USERNAME: ""
+  BACKUP_PASSWORD: ""
+  RK001_WAIT_HOURS: 6
+  RK001_MAX_RETRY: 4
+  RK001_SWITCH_AFTER: 2
+  RK001_SWITCH_WAIT_HOURS: 0.5
 schema:
   PHONE_NUMBER: str
   PASSWORD: password
@@ -51,3 +57,9 @@ schema:
   LLM_BASE_URL: str?
   LLM_MODEL: str?
   CACHE_REPUBLISH_INTERVAL: int?
+  BACKUP_USERNAME: str?
+  BACKUP_PASSWORD: password?
+  RK001_WAIT_HOURS: float(0.1,48)?
+  RK001_MAX_RETRY: int(1,20)?
+  RK001_SWITCH_AFTER: int(1,10)?
+  RK001_SWITCH_WAIT_HOURS: float(0.1,24)?
