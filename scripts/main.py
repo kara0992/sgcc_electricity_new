@@ -17,9 +17,14 @@ from data_fetcher import DataFetcher, RiskControlError
 # 国网风控(RK001)退避参数默认值，main() 中会按环境变量覆盖
 RK001_WAIT_HOURS = 6.0
 RK001_MAX_RETRY = 4
+# 同一账号连续被 RK001 拦截多少轮后，切换到备用账号（邮箱/第二账号）
+RK001_SWITCH_AFTER = 2
+# 切换账号后的等待时长（小时），换号本身已换了一条身份，不必再等满 6 小时
+RK001_SWITCH_WAIT_HOURS = 0.5
 
 def main():
     global RETRY_TIMES_LIMIT, RK001_WAIT_HOURS, RK001_MAX_RETRY
+    global RK001_SWITCH_AFTER, RK001_SWITCH_WAIT_HOURS
     if 'PYTHON_IN_DOCKER' not in os.environ:
         # 读取 .env 文件
         import dotenv
@@ -51,6 +56,11 @@ def main():
         # 遇到国网风控(RK001)时的退避策略：等待若干小时后再试，最多重试若干轮
         RK001_WAIT_HOURS = float(os.getenv("RK001_WAIT_HOURS", 6))
         RK001_MAX_RETRY = int(os.getenv("RK001_MAX_RETRY", 4))
+        # 备用账号（可为邮箱/用户名/第二个手机号）——主账号被风控时自动切换
+        BACKUP_USERNAME = (os.getenv("BACKUP_USERNAME") or "").strip()
+        BACKUP_PASSWORD = os.getenv("BACKUP_PASSWORD") or ""
+        RK001_SWITCH_AFTER = int(os.getenv("RK001_SWITCH_AFTER", 2))
+        RK001_SWITCH_WAIT_HOURS = float(os.getenv("RK001_SWITCH_WAIT_HOURS", 0.5))
 
         logger_init(LOG_LEVEL)
         logging.info(f"当前以Docker镜像方式运行。")
@@ -65,13 +75,20 @@ def main():
     logging.info(f"开始初始化 ErrorWatcher")
     ErrorWatcher.init(root_dir='/data/errors')
     logging.info(f'ErrorWatcher 初始化完成！')
-    fetcher = DataFetcher(PHONE_NUMBER, PASSWORD)
+    fetcher = DataFetcher(PHONE_NUMBER, PASSWORD, BACKUP_USERNAME, BACKUP_PASSWORD)
     updator = SensorUpdator()
 
     # 生成随机延迟时间（-10分钟到+10分钟）
     random_delay_minutes = random.randint(-10, 10)
     parsed_time = datetime.strptime(JOB_START_TIME, "%H:%M") + timedelta(minutes=random_delay_minutes)
     logging.info(f"风控退避策略：遇到 RK001 时等待 {RK001_WAIT_HOURS:g} 小时后再试，最多 {RK001_MAX_RETRY} 轮。")
+    if BACKUP_USERNAME:
+        logging.info(
+            f"多账号策略：同一账号连续 {RK001_SWITCH_AFTER} 轮被 RK001 拦截后，"
+            f"自动切换到备用账号（{DataFetcher._mask_account(BACKUP_USERNAME)}），"
+            f"切换后等待 {RK001_SWITCH_WAIT_HOURS:g} 小时再试。")
+    else:
+        logging.info("未配置备用账号(BACKUP_USERNAME)，RK001 时只在主账号上退避重试。")
     logging.info(f"当前登录用户名为 {PHONE_NUMBER}，Home Assistant 地址为 {HASS_URL}，程序将每天在 {parsed_time.strftime('%H:%M')} 执行。")
 
     # 添加随机延迟
@@ -125,14 +142,17 @@ def run_task(data_fetcher: DataFetcher):
     国网风控(RK001)：立即重试毫无意义且会加重风控，改为等待
     RK001_WAIT_HOURS 小时后再试，最多 RK001_MAX_RETRY 轮。
     """
-    rk_round = 0
+    rk_round = 0            # 本次任务累计 RK001 轮数（受 RK001_MAX_RETRY 限制）
+    rounds_on_account = 0   # 当前账号上连续被 RK001 的轮数（用于触发换号）
     while True:
         hit_rk001 = False
         for retry_times in range(1, RETRY_TIMES_LIMIT + 1):
             try:
                 data_fetcher.fetch()
                 if rk_round:
-                    logging.info(f"风控等待 {rk_round} 轮后登录成功，数据已恢复更新。")
+                    logging.info(
+                        f"风控等待 {rk_round} 轮后登录成功"
+                        f"（账号 {data_fetcher.current_account_label()}），数据已恢复更新。")
                 return
             except RuntimeError as e:
                 # LLM 配置错误等不可恢复错误，立即退出
@@ -151,17 +171,32 @@ def run_task(data_fetcher: DataFetcher):
             return
 
         rk_round += 1
+        rounds_on_account += 1
         if rk_round > RK001_MAX_RETRY:
             logging.error(
-                f"已连续 {RK001_MAX_RETRY} 轮因国网风控(RK001)等待后仍失败，"
+                f"已连续 {RK001_MAX_RETRY} 轮因国网风控(RK001)等待后仍失败"
+                f"（当前账号 {data_fetcher.current_account_label()}），"
                 f"本次任务结束，等下一次计划任务；建议更换出口 IP 或再等更久。")
             return
 
+        wait_hours = RK001_WAIT_HOURS
+        # 同一账号被 RK001 连续拦截达到阈值 → 换备用账号，换号后等待时间更短
+        if (data_fetcher.has_backup_account()
+                and RK001_SWITCH_AFTER > 0
+                and rounds_on_account >= RK001_SWITCH_AFTER):
+            switched = data_fetcher.switch_account(
+                f"账号 {data_fetcher.current_account_label()} 已连续 "
+                f"{rounds_on_account} 轮被 RK001 风控")
+            if switched:
+                rounds_on_account = 0
+                wait_hours = RK001_SWITCH_WAIT_HOURS
+
         # 加一点随机抖动（0~5%），避免固定整点特征被风控识别
-        wait_seconds = RK001_WAIT_HOURS * 3600 * (1 + random.uniform(0, 0.05))
+        wait_seconds = wait_hours * 3600 * (1 + random.uniform(0, 0.05))
         _sleep_until_retry(
             wait_seconds,
-            f"国网风控(RK001) 第 {rk_round}/{RK001_MAX_RETRY} 轮退避")
+            f"国网风控(RK001) 第 {rk_round}/{RK001_MAX_RETRY} 轮退避"
+            f"（账号 {data_fetcher.current_account_label()}）")
 
 def logger_init(level: str):
     logger = logging.getLogger()
