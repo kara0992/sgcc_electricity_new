@@ -47,6 +47,14 @@ class RiskControlError(Exception):
     """
 
 
+class CredentialError(Exception):
+    """账号或密码错误。
+
+    95598 的规则是「连续错误 5 次锁定 20 分钟」，所以这类错误绝不能像普通
+    异常那样自动重试 5 次，必须立刻停下，等人确认账号密码。
+    """
+
+
 class DataFetcher:
 
     def __init__(self, username: str, password: str,
@@ -700,6 +708,7 @@ class DataFetcher:
     def _login(self, page, phone_code=False):
         # 设置 RK001 网络响应拦截器 — 在 API 层面捕获风控
         self._rk001_detected = False
+        self._credential_error = False
 
         def _on_response(response):
             try:
@@ -843,6 +852,12 @@ class DataFetcher:
                     error = self._get_error_message(page, "//div[@class='errmsg-tip']//span")
                     if error:
                         logging.info(f"验证码通过但登录失败: [{error}]\r")
+                        if any(k in str(error) for k in
+                               ("账号或密码错误", "用户名或密码错误", "密码错误", "账号不存在")):
+                            self._credential_error = True
+                            logging.error(
+                                "检测到「账号或密码错误」：继续重试会触发"
+                                "「连续错误 5 次锁定 20 分钟」，本次立即停止。")
                     else:
                         try:
                             page.screenshot(path="/data/debug_after_captcha.png")
@@ -1092,6 +1107,10 @@ class DataFetcher:
                 self._browser.close()
                 if getattr(self, '_pw', None):
                     self._pw.stop()
+                if getattr(self, "_credential_error", False):
+                    raise CredentialError(
+                        f"账号 {self.current_account_label()} 登录被拒绝：账号或密码错误"
+                        f"（国网连续错误 5 次会锁定 20 分钟，已停止尝试）")
                 if rk001_hit:
                     self.note_rk001()
                     raise RiskControlError(
