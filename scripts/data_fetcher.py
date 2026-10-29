@@ -8,6 +8,7 @@ import subprocess
 
 import random
 import base64
+import urllib.request
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PltTimeout
 from sensor_updator import SensorUpdator
@@ -1074,6 +1075,84 @@ class DataFetcher:
     # “整张验证码截图 + 坐标点击”方案，且使用专门面向文字顺序任务的提示词。
     # ──────────────────────────────────────────────────────────────
 
+    def _publish_daily_series(self, user_id, tou_data, page=None):
+        """把最近若干天的日用电量发布成一条“序列”传感器。
+
+        背景：本插件原先只发布 sensor.last_electricity_usage_<后4位>（最近一天）。
+        一旦有几天登录失败，这几天就永远补不回来了 —— 下次登录成功时只发“最新
+        一天”，中间的日期直接断档（例如 10-24/10-25 一直缺失）。
+
+        这里把页面上能拿到的整段日数据（默认近 7 天，含谷/平/峰/尖）一次性发布为：
+            sensor.electricity_daily_series_<后4位>
+            state     = 天数
+            attributes.days = {"2026-10-28": [总, 谷, 平, 峰, 尖], ...}
+        Home Assistant 里的 state_grid_info 集成会读这条属性，把缺失的日期逐天补齐。
+        """
+        try:
+            rows = (tou_data or {}).get("daily") or []
+            days = {}
+            for row in rows:
+                day = str(row.get("date") or "").strip()
+                # 兼容 20261028 / 2026-10-28 两种写法
+                if len(day) == 8 and day.isdigit():
+                    day = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+                if len(day) < 10:
+                    continue
+                try:
+                    total = float(row.get("total_usage"))
+                except (TypeError, ValueError):
+                    continue
+                if total <= 0:
+                    continue
+
+                def _f(key):
+                    try:
+                        return round(float(row.get(key) or 0), 2)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+                days[day] = [
+                    round(total, 2),
+                    _f("valley_usage"),
+                    _f("flat_usage"),
+                    _f("peak_usage"),
+                    _f("tip_usage"),
+                ]
+
+            if not days:
+                logging.info(f"[{user_id}] 没有可发布的日用电序列（Vue state 无日数据）")
+                return
+
+            hass_url = (os.getenv("HASS_URL") or "").rstrip("/")
+            token = os.getenv("HASS_TOKEN") or ""
+            if not hass_url or not token:
+                logging.warning(f"[{user_id}] 缺少 HASS_URL/HASS_TOKEN，跳过日用电序列发布")
+                return
+
+            sensor = f"sensor.electricity_daily_series_{str(user_id)[-4:]}"
+            body = json.dumps({
+                "state": len(days),
+                "unique_id": sensor,
+                "attributes": {
+                    "days": days,
+                    "latest_day": max(days),
+                    "unit_of_measurement": "天",
+                    "icon": "mdi:calendar-range",
+                    "friendly_name": f"日用电量序列({min(days)}~{max(days)})",
+                },
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                hass_url + "/api/states/" + sensor, data=body, method="POST")
+            req.add_header("Authorization", "Bearer " + token)
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                resp.read()
+            logging.info(
+                f"[{user_id}] 日用电序列已发布: {len(days)} 天 "
+                f"({min(days)} ~ {max(days)})，供集成补齐缺失日期")
+        except Exception as e:
+            logging.warning(f"[{user_id}] 日用电序列发布失败(不影响主流程): {e}")
+
     def fetch(self):
         try:
             self._browser, self._context, self._page = self._setup_browser()
@@ -1144,6 +1223,8 @@ class DataFetcher:
                 updator.update_one_userid(
                     user_id, balance, ldd, ldu, yc, yu, mc, mu,
                     tou_data=td, enhanced_balance=eb, bill_tou_data=bt)
+                # 额外发布“最近 7 天”的日用电序列，供集成补齐历史空缺日期
+                self._publish_daily_series(user_id, td)
                 time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT)
             except Exception as e:
                 continue
