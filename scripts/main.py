@@ -12,7 +12,7 @@ from sensor_updator import SensorUpdator
 
 from datetime import datetime,timedelta
 from const import *
-from data_fetcher import DataFetcher, RiskControlError
+from data_fetcher import DataFetcher, RiskControlError, CredentialError
 
 # 国网风控(RK001)处理参数默认值，main() 中会按环境变量覆盖
 # 说明：不再做 6 小时长退避，恢复原来的短间隔重试节奏；
@@ -146,6 +146,12 @@ def run_task(data_fetcher: DataFetcher):
             # LLM 配置错误等不可恢复错误，立即退出
             logging.error(f"致命错误，程序退出: {e}")
             sys.exit(1)
+        except CredentialError as e:
+            # 账号/密码错误：绝不重试（5 次错误会锁号 20 分钟），直接停
+            logging.error(
+                f"[凭证错误] {e}；本次任务终止，请先核对账号与密码"
+                f"（或该邮箱是否已绑定为该国网账号的登录名）。")
+            return
         except RiskControlError as e:
             rk_attempt += 1
             rounds_on_account += 1
