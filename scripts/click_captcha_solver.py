@@ -43,7 +43,13 @@ class ClickCaptchaSolver:
         if self._client is None:
             if not self.api_key:
                 raise RuntimeError("LLM_API_KEY 未设置，验证码解算将失败")
-            self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+            # 超时保护：模型响应偶发 3~6 分钟（含思考链 / 上游 503 重试），
+            # 不设上限会把整次登录的时间预算耗光。默认 90 秒，超时即放弃本张图，
+            # 由上层刷新验证码重试。
+            llm_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
+            self._client = OpenAI(
+                base_url=self.base_url, api_key=self.api_key,
+                timeout=llm_timeout, max_retries=0)
         return self._client
 
     def solve(self, ref_url: str, main_url: str,
@@ -138,23 +144,35 @@ class ClickCaptchaSolver:
         content.append({"type": "text", "text": "Use only the visible captcha image above. Return center coordinates for A, B, C as JSON. Do not use page or hidden DOM coordinates."})
         content.append({"type": "text", "text": prompt})
 
+        params = dict(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "Output valid JSON only. No markdown, no explanation."},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=1024,
+            response_format={"type": "json_object"},
+        )
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Output valid JSON only. No markdown, no explanation."},
-                    {"role": "user", "content": content},
-                ],
-                max_tokens=4096,
-                response_format={"type": "json_object"},
-            )
+            # Qwen3 系列默认会输出大段“思考链”，单张图能拖到 3~6 分钟；
+            # 关闭思考后通常 3~10 秒返回。部分模型不认这个参数，则退回普通调用。
+            try:
+                response = self.client.chat.completions.create(
+                    **params, extra_body={"enable_thinking": False})
+            except Exception as inner:
+                if "enable_thinking" in str(inner) or "400" in str(inner):
+                    logger.warning("模型不接受 enable_thinking 参数，改用普通调用")
+                    response = self.client.chat.completions.create(**params)
+                else:
+                    raise
             output = response.choices[0].message.content or ""
             logger.info(f"大模型响应: {output[:400]}")
             return self._parse_coordinates(output, main_width, main_height)
         except Exception as e:
-            logger.error(f"大模型错误: {e}")
-            # 400/401/403 等配置错误不应重试，直接抛出终止
-            raise RuntimeError(f"LLM 调用失败: {e}") from e
+            # 超时/503/网络抖动都属于“这张图没解出来”，返回空让上层刷新验证码重试；
+            # 不要抛 RuntimeError（上层会当成致命错误直接退出进程）。
+            logger.error(f"大模型错误（本张验证码放弃，将刷新重试）: {e}")
+            return []
 
     def _parse_coordinates(self, text: str,
                            main_width: int, main_height: int) -> List[Tuple[int, int]]:
