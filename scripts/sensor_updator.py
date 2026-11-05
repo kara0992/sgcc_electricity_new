@@ -98,7 +98,13 @@ class SensorUpdator:
         except Exception as e:
             logging.error(f"保存缓存文件失败 {abs_cache_file}: {e}")
 
-    def republish(self):
+    def republish(self, allow_stale=False):
+        """重发缓存到 HA。
+
+        allow_stale=False（原行为）：缓存日期不是今天则返回 False，由上层触发重新登录；
+        allow_stale=True（仅重发模式）：跳过日期检查，把缓存原样推给 HA，
+        用于低频登录模式下保持 HA 传感器不丢失，绝不触发登录。
+        """
         cache_file = self._get_cache_file()
         abs_cache_file = os.path.abspath(cache_file)
         if not os.path.exists(cache_file):
@@ -113,14 +119,17 @@ class SensorUpdator:
             logging.error(f"加载缓存文件失败 {abs_cache_file}: {e}")
             return False
 
-        # 检查缓存数据的日期是否与当前日期一致
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        for user_id, values in data.items():
-            cache_timestamp = values.get("timestamp", "")
-            cache_date = cache_timestamp[:10] if cache_timestamp else ""
-            if cache_date != today_str:
-                logging.info(f"缓存数据日期({cache_date})与当前日期({today_str})不一致，需要从国家电网重新获取数据。")
-                return False
+        if allow_stale:
+            logging.info("仅重发模式：跳过缓存日期检查，直接推送缓存数据。")
+        else:
+            # 检查缓存数据的日期是否与当前日期一致
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for user_id, values in data.items():
+                cache_timestamp = values.get("timestamp", "")
+                cache_date = cache_timestamp[:10] if cache_timestamp else ""
+                if cache_date != today_str:
+                    logging.info(f"缓存数据日期({cache_date})与当前日期({today_str})不一致，需要从国家电网重新获取数据。")
+                    return False
 
         try:
             for user_id, values in data.items():
