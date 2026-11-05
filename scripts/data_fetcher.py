@@ -1706,20 +1706,33 @@ class DataFetcher:
 
     # 增加获取每日用电量的函数
     def _get_daily_usage_data(self):
-        """获取每日用电量数据 (7天或30天)，通过 radio 按钮切换，失败时返回空列表"""
+        """获取每日用电量数据 (7天或30天)，通过 radio 按钮切换，失败时返回空列表。
+
+        说明：只有开通“智能缴费”的账号才有“近30天”选项；未开通时强查 30 天
+        会出错。这里先按配置尝试，30 天失败时自动退回近 7 天重试，保证拿得到数据。
+        """
+        fetch_days = int(os.getenv("DAILY_FETCH_DAYS", 7))
+        if fetch_days not in (7, 30):
+            fetch_days = 7
+        logging.info(f"正在获取每日用电量数据 (最近 {fetch_days} 天)")
+        date, usages = self._fetch_daily_rows(fetch_days == 30)
+        if not usages and fetch_days == 30:
+            logging.warning(
+                "近30天日用电量获取失败（可能未开通智能缴费），自动退回近7天重试")
+            date, usages = self._fetch_daily_rows(False, fallback=True)
+        return date, usages
+
+    def _fetch_daily_rows(self, use_30, fallback=False):
+        """进入“日用电量”tab 抓取表格；fallback=True 时显式点回“近7天”。"""
         try:
-            fetch_days = int(os.getenv("DAILY_FETCH_DAYS", 7))
-            if fetch_days not in (7, 30):
-                fetch_days = 7
-            logging.info(f"正在获取每日用电量数据 (最近 {fetch_days} 天)")
             # 点击"日用电量" tab
             self._click_button(self._page, "xpath=" + "//div[@class='el-tabs__nav is-top']/div[@id='tab-second']")
             time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT * 3)
 
-            # 通过 radio 按钮点击 7天 或 30天
-            if fetch_days == 30:
+            if use_30:
+                # 通过 radio 按钮点击 30天
                 try:
-                    radio = self._page.query_selector("xpath=" + 
+                    radio = self._page.query_selector("xpath=" +
                         "//span[contains(@class,'el-radio__label') and contains(text(),'近30天')]"
                         "/preceding-sibling::span//input[@class='el-radio__original']")
                     radio.click()
@@ -1731,6 +1744,16 @@ class DataFetcher:
                         logging.info("已点击 '近30天' 备用方案")
                     except Exception:
                         logging.warning("未找到 '近30天' radio, 使用默认数据")
+            elif fallback:
+                # 30 天失败退回 7 天：显式点击“近7天” radio，避免页面停在报错状态
+                try:
+                    radio = self._page.query_selector("xpath=" +
+                        "//span[contains(@class,'el-radio__label') and contains(text(),'近7天')]"
+                        "/preceding-sibling::span//input[@class='el-radio__original']")
+                    radio.click()
+                    logging.info("已点击 '近7天' radio 按钮")
+                except Exception:
+                    logging.info("未找到 '近7天' radio，使用页面默认数据")
             time.sleep(self.RETRY_WAIT_TIME_OFFSET_UNIT * 3)
 
             # 等待日用电量表格出现（用 attached 替代 visible，避免匹配到隐藏 tab 的元素导致超时）
