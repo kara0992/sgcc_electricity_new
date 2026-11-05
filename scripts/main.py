@@ -90,18 +90,56 @@ def main():
             f"自动切换到备用账号（{DataFetcher._mask_account(BACKUP_USERNAME)}）。")
     else:
         logging.info("未配置备用账号(BACKUP_USERNAME)，RK001 时只在主账号上重试。")
-    logging.info(f"当前登录用户名为 {PHONE_NUMBER}，Home Assistant 地址为 {HASS_URL}，程序将每天在 {parsed_time.strftime('%H:%M')} 执行。")
+    logging.info(f"当前登录用户名为 {PHONE_NUMBER}，Home Assistant 地址为 {HASS_URL}。")
 
     # 添加随机延迟
     next_run_time = parsed_time + timedelta(hours=12)
 
     logging.info(f'立即执行任务！下次运行时间为每天 {parsed_time.strftime("%H:%M")} 和 {next_run_time.strftime("%H:%M")}')
-    schedule.every().day.at(parsed_time.strftime("%H:%M")).do(run_task, fetcher)
-    schedule.every().day.at(next_run_time.strftime("%H:%M")).do(run_task, fetcher)
+    # 登录计划：每 LOGIN_INTERVAL_DAYS 天登录一次；登录日当天跑 LOGIN_TIMES_PER_DAY 次
+    # （第 2 次在 12 小时后，作为第一次完全失败的兜底）。
+    # 锚点日期持久化到 /data，保证重启后“哪天是登录日”的计算不变。
+    interval_days = max(1, int(os.getenv("LOGIN_INTERVAL_DAYS", 1)))
+    times_per_day = min(2, max(1, int(os.getenv("LOGIN_TIMES_PER_DAY", 2))))
+    from const import get_data_dir
+    anchor_file = os.path.join(get_data_dir(), "login_anchor.json")
+    anchor_date = datetime.now().date()
+    try:
+        if os.path.exists(anchor_file):
+            with open(anchor_file) as f:
+                saved = json.load(f)
+            if saved.get("interval") != interval_days:
+                raise ValueError("interval changed")
+            anchor_date = datetime.strptime(saved.get("anchor"), "%Y-%m-%d").date()
+        else:
+            raise ValueError("no anchor file")
+    except Exception:
+        anchor_date = datetime.now().date()
+        try:
+            with open(anchor_file, "w") as f:
+                json.dump({"anchor": anchor_date.strftime("%Y-%m-%d"),
+                           "interval": interval_days}, f)
+        except Exception as e:
+            logging.warning(f"写入登录锚点失败（不影响运行）: {e}")
+    logging.info(
+        f"登录频率：每 {interval_days} 天登录一次国网，登录日执行 {times_per_day} 次"
+        f"（锚点日期 {anchor_date}）。")
 
-    # 重发缓存到 HA 的间隔（分钟），默认 60 分钟，用于防止 HA 重启后数据丢失
+    def scheduled_login(task_fetcher, label):
+        offset = (datetime.now().date() - anchor_date).days
+        if interval_days > 1 and offset % interval_days != 0:
+            logging.info(
+                f"今天不是登录日（每 {interval_days} 天登录一次），跳过{label}登录。")
+            return
+        run_task(task_fetcher)
+
+    schedule.every().day.at(parsed_time.strftime("%H:%M")).do(scheduled_login, fetcher, "上午")
+    if times_per_day >= 2:
+        schedule.every().day.at(next_run_time.strftime("%H:%M")).do(scheduled_login, fetcher, "晚间")
+
+    # 仅重发缓存到 HA 的间隔（分钟），默认 60 分钟，用于防止 HA 重启后数据丢失
     CACHE_REPUBLISH_INTERVAL = int(os.getenv("CACHE_REPUBLISH_INTERVAL", "60"))
-    schedule.every(CACHE_REPUBLISH_INTERVAL).minutes.do(republish_or_fetch, updator, fetcher)
+    schedule.every(CACHE_REPUBLISH_INTERVAL).minutes.do(republish_cache, updator, fetcher)
 
     # 启动先把缓存里的“最近几天”日用电序列补发一次：
     # 不发新登录，也能让集成把之前漏掉的日期补齐（如 10-24/10-25）
@@ -109,11 +147,11 @@ def main():
 
     # 启动时先尝试从缓存恢复
     # 如果缓存恢复成功，则跳过本次启动时的实时抓取，避免频繁重启导致账号被封
-    if not updator.republish():
+    if updator.republish(allow_stale=True):
+        logging.info("已从缓存恢复数据，跳过启动时抓取以保护账号。")
+    else:
         logging.info("未找到有效缓存，正在从国家电网获取数据...")
         run_task(fetcher)
-    else:
-        logging.info("已从缓存恢复数据，跳过启动时抓取以保护账号。")
 
     while True:
         schedule.run_pending()
@@ -141,13 +179,13 @@ def publish_cached_daily_series(fetcher: DataFetcher):
         logging.warning(f"补发日用电序列失败(不影响主流程): {e}")
 
 
-def republish_or_fetch(updator: SensorUpdator, fetcher: DataFetcher):
-    if not updator.republish():
-        logging.info("缓存数据已过期或不存在，正在从国家电网获取数据...")
-        run_task(fetcher)
-    else:
+def republish_cache(updator: SensorUpdator, fetcher: DataFetcher):
+    """仅把缓存重发到 HA（绝不登录国网），登录频率完全由计划任务控制。"""
+    if updator.republish(allow_stale=True):
         # 缓存重发成功，顺带补发一次日用电序列（用于补齐历史空缺日期）
         publish_cached_daily_series(fetcher)
+    else:
+        logging.info("缓存不存在或损坏，等待下一次计划登录时抓取。")
 
 
 def run_task(data_fetcher: DataFetcher):
