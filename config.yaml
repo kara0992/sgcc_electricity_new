@@ -1,5 +1,5 @@
 name: "SGCC Electricity (patched)"
-version: "v1.8.7"
+version: "v1.8.8"
 slug: "sgcc_electricity_patched"
 description: "获取国网电费数据的插件"
 url: "https://github.com/ARC-MX/sgcc_electricity_new"
@@ -38,6 +38,9 @@ options:
   RK001_MAX_RETRY: 4
   RK001_RETRY_WAIT_SECONDS: 60
   RK001_SWITCH_AFTER: 2
+  LOGIN_INTERVAL_DAYS: 1
+  LOGIN_TIMES_PER_DAY: 2
+  DAILY_FETCH_DAYS: 7
 schema:
   PHONE_NUMBER: str
   PASSWORD: password
@@ -61,3 +64,6 @@ schema:
   RK001_MAX_RETRY: int(1,20)?
   RK001_RETRY_WAIT_SECONDS: int(0,600)?
   RK001_SWITCH_AFTER: int(1,10)?
+  LOGIN_INTERVAL_DAYS: int(1,30)?
+  LOGIN_TIMES_PER_DAY: int(1,2)?
+  DAILY_FETCH_DAYS: int(7,30)?
