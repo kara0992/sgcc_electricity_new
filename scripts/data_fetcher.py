@@ -1183,6 +1183,14 @@ class DataFetcher:
             except Exception as e:
                 logging.error(f"Login error: {e}")
                 rk001_hit = bool(getattr(self, "_rk001_detected", False))
+                if not rk001_hit:
+                    # 兜底：登录窗仍开着时再查一次页面（错误提示条里的 RK001）。
+                    # 之前正是缺了这一步，导致「验证码通过但返回 RK001」被当成
+                    # 普通异常重试 5 次，既不计数也不换号。
+                    try:
+                        rk001_hit = self._is_rk001_blocked(self._page)
+                    except Exception:
+                        rk001_hit = False
                 self._browser.close()
                 if getattr(self, '_pw', None):
                     self._pw.stop()
@@ -1194,7 +1202,7 @@ class DataFetcher:
                     self.note_rk001()
                     raise RiskControlError(
                         f"国网风控 RK001：账号 {self.current_account_label()} "
-                        f"本轮登录被拦截，需要长时间退避后再试")
+                        f"本轮登录被拦截，需换号或等下一次计划登录")
                 raise
             logging.info("Logged in")
             self.reset_rk001()
