@@ -23,6 +23,7 @@ _COOKIE_FILE = os.path.join(get_data_dir(), "sgcc_cookies.json")
 import numpy as np
 from captcha_playwright import solve_captcha_in_browser
 from captcha_text_sequence import solve_text_sequence_captcha
+from click_captcha_solver import LLMFatalError
 import vue_state
 
 # CloakBrowser: C++ 源码级隐身 Chromium，Playwright 的 drop-in 替代
@@ -53,6 +54,14 @@ class CredentialError(Exception):
 
     95598 的规则是「连续错误 5 次锁定 20 分钟」，所以这类错误绝不能像普通
     异常那样自动重试 5 次，必须立刻停下，等人确认账号密码。
+    """
+
+
+class LLMUnavailableError(Exception):
+    """验证码识别所依赖的大模型不可用（余额不足/密钥失效/模型下线）。
+
+    与风控、网络抖动不同，这种情况重试毫无意义：每张验证码都要调用大模型，
+    继续重试只会把本次登录机会耗干。必须立刻中止本轮任务，等人工处理。
     """
 
 
@@ -912,7 +921,13 @@ class DataFetcher:
                     page.remove_listener("response", _on_response)
                     return False
 
-                captcha_passed = solve_captcha_in_browser(page, max_retries=self.RETRY_TIMES_LIMIT)
+                try:
+                    captcha_passed = solve_captcha_in_browser(page, max_retries=self.RETRY_TIMES_LIMIT)
+                except LLMFatalError as llm_err:
+                    logging.error(
+                        f"[验证码/大模型] 不可用，立即中止本轮登录：{llm_err}\r"
+                    )
+                    raise LLMUnavailableError(str(llm_err)) from llm_err
                 if captcha_passed:
                     logging.info("验证码已通过，等待页面跳转...")
                     # 等待更长时间让登录 API 完成
@@ -1180,6 +1195,18 @@ class DataFetcher:
                 else:
                     if not self._login(self._page):
                         raise Exception("login failed")
+            except LLMUnavailableError:
+                # 大模型挂了跟账号/风控无关：不计风控次数、不换号、不重试
+                logging.error(
+                    "[验证码/大模型] 本轮登录中止（不计入风控、不切换账号），"
+                    "请检查 LLM_API_KEY 余额或更换模型。\r")
+                try:
+                    self._browser.close()
+                except Exception:
+                    pass
+                if getattr(self, '_pw', None):
+                    self._pw.stop()
+                raise
             except Exception as e:
                 logging.error(f"Login error: {e}")
                 rk001_hit = bool(getattr(self, "_rk001_detected", False))
