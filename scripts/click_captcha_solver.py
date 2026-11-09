@@ -173,20 +173,32 @@ class ClickCaptchaSolver:
                 {"role": "user", "content": content},
             ],
             max_tokens=1024,
-            response_format={"type": "json_object"},
         )
+        # 不同供应商对可选参数的支持不一样（硅基流动认 enable_thinking，
+        # 智谱不认；部分模型不支持 response_format）。按「特性从多到少」依次降级，
+        # 只有余额/鉴权类错误才立刻中止，其余降级重试。
+        variants = [
+            dict(response_format={"type": "json_object"},
+                 extra_body={"enable_thinking": False}),
+            dict(extra_body={"enable_thinking": False}),
+            dict(),
+        ]
+        last_err: Optional[Exception] = None
         try:
-            # Qwen3 系列默认会输出大段“思考链”，单张图能拖到 3~6 分钟；
-            # 关闭思考后通常 3~10 秒返回。部分模型不认这个参数，则退回普通调用。
-            try:
-                response = self.client.chat.completions.create(
-                    **params, extra_body={"enable_thinking": False})
-            except Exception as inner:
-                if "enable_thinking" in str(inner) or "400" in str(inner):
-                    logger.warning("模型不接受 enable_thinking 参数，改用普通调用")
-                    response = self.client.chat.completions.create(**params)
-                else:
-                    raise
+            response = None
+            for idx, extra in enumerate(variants):
+                try:
+                    response = self.client.chat.completions.create(**params, **extra)
+                    if idx:
+                        logger.info(f"已降级到第 {idx + 1} 种调用方式（去掉不支持的参数）")
+                    break
+                except Exception as inner:  # noqa: BLE001
+                    if _is_fatal_llm_error(inner):
+                        raise
+                    logger.warning(f"第 {idx + 1} 种调用方式失败，降级重试：{inner}")
+                    last_err = inner
+            if response is None:
+                raise last_err or RuntimeError("大模型无响应")
             output = response.choices[0].message.content or ""
             logger.info(f"大模型响应: {output[:400]}")
             return self._parse_coordinates(output, main_width, main_height)
