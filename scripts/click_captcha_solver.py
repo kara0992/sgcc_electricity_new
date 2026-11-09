@@ -26,6 +26,28 @@ import const
 logger = logging.getLogger(__name__)
 
 
+class LLMFatalError(Exception):
+    """大模型侧不可恢复的错误（余额不足 / 鉴权失败 / 模型下线）。
+
+    这类错误重试多少次都不会变好：继续刷验证码只会白白耗掉本次登录机会，
+    还会让国网看到更多次失败登录。上层收到后必须立刻中止本轮任务。
+    """
+
+
+def _is_fatal_llm_error(exc: Exception) -> bool:
+    """判断异常是否属于“重试也没用”的大模型错误。"""
+    status = getattr(exc, "status_code", None)
+    if status in (401, 402, 403):
+        return True
+    text = str(exc)
+    for pat in ("402", "401 ", "403", "insufficient", "balance",
+                "Invalid token", "invalid_api_key", "Unauthorized",
+                "Model disabled", "model_not_found", "does not exist"):
+        if pat.lower() in text.lower():
+            return True
+    return False
+
+
 class ClickCaptchaSolver:
     """基于大模型的点击验证码解算器。"""
 
@@ -42,7 +64,7 @@ class ClickCaptchaSolver:
     def client(self) -> OpenAI:
         if self._client is None:
             if not self.api_key:
-                raise RuntimeError("LLM_API_KEY 未设置，验证码解算将失败")
+                raise LLMFatalError("LLM_API_KEY 未设置，无法识别验证码")
             # 超时保护：模型响应偶发 3~6 分钟（含思考链 / 上游 503 重试），
             # 不设上限会把整次登录的时间预算耗光。默认 90 秒，超时即放弃本张图，
             # 由上层刷新验证码重试。
@@ -169,6 +191,10 @@ class ClickCaptchaSolver:
             logger.info(f"大模型响应: {output[:400]}")
             return self._parse_coordinates(output, main_width, main_height)
         except Exception as e:
+            if _is_fatal_llm_error(e):
+                raise LLMFatalError(
+                    f"验证码大模型不可用（{self.base_url} / {self.model}）：{e}"
+                ) from e
             # 超时/503/网络抖动都属于“这张图没解出来”，返回空让上层刷新验证码重试；
             # 不要抛 RuntimeError（上层会当成致命错误直接退出进程）。
             logger.error(f"大模型错误（本张验证码放弃，将刷新重试）: {e}")
@@ -214,3 +240,26 @@ class ClickCaptchaSolver:
             else:
                 result.append((round(x), round(y)))
         return result
+
+
+def probe_llm() -> None:
+    """登录前的轻量探活（1 token 请求）。
+
+    只拦“重试也不会好”的错误（余额不足 / 密钥失效 / 模型下线），直接抛
+    LLMFatalError，让上层在**打开浏览器之前**就放弃本轮，避免白白登录一次、
+    平白增加风控暴露面。网络抖动/超时等一律放行，交给正常流程重试。
+    """
+    solver = ClickCaptchaSolver()
+    try:
+        solver.client.chat.completions.create(
+            model=solver.model,
+            messages=[{"role": "user", "content": "ok"}],
+            max_tokens=1,
+        )
+        logger.info(f"验证码大模型探活成功（{solver.model} @ {solver.base_url}）")
+    except Exception as e:  # noqa: BLE001
+        if _is_fatal_llm_error(e):
+            raise LLMFatalError(
+                f"验证码大模型不可用（{solver.base_url} / {solver.model}）：{e}"
+            ) from e
+        logger.warning(f"验证码大模型探活未成功（按可恢复处理，继续登录）：{e}")
