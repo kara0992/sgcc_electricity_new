@@ -12,7 +12,10 @@ from sensor_updator import SensorUpdator
 
 from datetime import datetime,timedelta
 from const import *
-from data_fetcher import DataFetcher, RiskControlError, CredentialError
+from data_fetcher import (
+    DataFetcher, RiskControlError, CredentialError, LLMUnavailableError,
+)
+from click_captcha_solver import LLMFatalError, probe_llm
 
 # 国网风控(RK001)处理参数默认值，main() 中会按环境变量覆盖
 # 说明：不再做 6 小时长退避，恢复原来的短间隔重试节奏；
@@ -200,6 +203,16 @@ def run_task(data_fetcher: DataFetcher):
     rk_attempt = 0       # 本次任务里 RK001 的尝试次数
     rounds_on_account = 0  # 当前账号上连续被 RK001 的次数（用于触发换号）
 
+    # 开浏览器、点登录之前先确认验证码大模型能用。余额不足/密钥失效时直接跳过，
+    # 免得白白登录一次（每一次失败的登录都在增加风控暴露面）。
+    try:
+        probe_llm()
+    except LLMFatalError as e:
+        logging.error(
+            f"[验证码大模型不可用] {e}；本轮跳过登录（不打开浏览器、不重试）。"
+            f"请在加载项配置里给 LLM_API_KEY 充值，或换成可用的 LLM_BASE_URL / LLM_MODEL。")
+        return
+
     while True:
         try:
             data_fetcher.fetch()
@@ -217,6 +230,13 @@ def run_task(data_fetcher: DataFetcher):
             logging.error(
                 f"[凭证错误] {e}；本次任务终止，请先核对账号与密码"
                 f"（或该邮箱是否已绑定为该国网账号的登录名）。")
+            return
+        except LLMUnavailableError as e:
+            # 验证码大模型余额不足/密钥失效：重试无意义，立刻停，别浪费登录机会
+            logging.error(
+                f"[验证码大模型不可用] {e}；本次任务立即终止（不重试、不换号）。"
+                f"请在加载项配置里给 LLM_API_KEY 充值，或改成可用的 "
+                f"LLM_BASE_URL / LLM_MODEL。")
             return
         except RiskControlError as e:
             rk_attempt += 1
